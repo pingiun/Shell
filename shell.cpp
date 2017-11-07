@@ -10,6 +10,19 @@
  * as implemented in this shell is more complicated than needed for the easy syntax. However using this parser, it was
  * really easy to add the >> operator, and even more syntax elements could be easily added.
  *
+ * When executing the input, executeCommand(Command) first checks if STDIN needs to be read from a file. It uses
+ * open() to open the file if needed, otherwise STDIN_FILENO is used to pass to executeCommand(Command, input).
+ * This function will fork(), and the child will dup2() the needed STDIN and STDOUT file pointers. Sometimes STDIN
+ * is dup2()'ed to STDIN, but this causes no problems.
+ * The child uses close() to close it's unneeded pipe end, the parent does too. The last pipe output is send back to
+ * executeCommand(Command). It will check if the data needs to be redirected to a file or to STDOUT, and will copy
+ * from the pipe to the required file pointer.
+ * If the input has a & at the end, the function is done. Otherwise it will use waitpid() to wait for the children to
+ * complete.
+ *
+ * shell() will continue executing input lines unless showPrompt is false, which means the shell is in testing mode
+ * and it will quit.
+ *
  * Jelle Besseling (s4743636)
  */
 
@@ -201,8 +214,8 @@ struct Command {
     /**
      * Constructor for the empty command
      */
-    explicit Command() : command(nullptr), args(nullptr), bg(false), redir_in(nullptr), redir_out(nullptr),
-                         pipe_to(nullptr) {}
+    explicit Command() : command(nullptr), args(nullptr), bg(false), append(false), redir_in(nullptr),
+                         redir_out(nullptr), pipe_to(nullptr) {}
 
     bool operator==(const Command &rhs) const {
         if (!strEqOrNull(command, rhs.command)) {
@@ -344,6 +357,9 @@ Command *buildCommands(std::vector<Token *> tokens) {
 
 /**
  * Tries to execute command as a builtin
+ *
+ * Has no test cases because of awkward side-effects, but was thoroughly tested by hand
+ *
  * @param command the command to try to execute
  * @return true if the command was executed as a builtin
  */
@@ -356,8 +372,14 @@ bool executeBuiltin(Command *command) {
     }
     std::vector<std::string *> &args = *(command->args);
     if (args.size() == 2 && strcmp(command->command, "cd") == 0) {
-        if (chdir(args[1]->c_str()) < 0) {
-            perror("cd");
+        if (*args[1] == std::string("~")) { // Unfortunately the only case when ~ is expanded
+            if (chdir(getenv("HOME")) < 0) {
+                perror("cd");
+            }
+        } else {
+            if (chdir(args[1]->c_str()) < 0) {
+                perror("cd");
+            }
         }
         return true;
     }
@@ -365,10 +387,11 @@ bool executeBuiltin(Command *command) {
 }
 
 /**
- * Calls itself recursively until the last command, needs to be called by executeCommand(Command)
+ * Calls itself recursively until the last command. Needs to be called by executeCommand(Command)
+ *
  * @param command command to execute
- * @param input output end from previous pipe
- * @return output end from current pipe
+ * @param input reading end from previous pipe
+ * @return reading end from current pipe
  */
 int executeCommand(Command *command, int input) {
     int pipefd[2];
@@ -377,17 +400,18 @@ int executeCommand(Command *command, int input) {
         exit(EXIT_FAILURE);
     }
 
-    std::vector<std::string *> &args = *(command->args);
-    auto **c_args = new char *[args.size() + 2];
-    for (size_t i = 1; i < args.size(); i++)
-        c_args[i] = strdup(args[i]->c_str());
-    c_args[0] = strdup(command->command);
-    c_args[args.size()] = nullptr;
-
     pid_t child_pid = fork();
     if (child_pid == 0) {
+        std::vector<std::string *> &args = *(command->args);
+        auto **c_args = new char *[args.size() + 2];
+        for (size_t i = 1; i < args.size(); i++)
+            c_args[i] = strdup(args[i]->c_str());
+        c_args[0] = strdup(command->command);
+        c_args[args.size()] = nullptr;
+
         dup2(input, STDIN_FILENO);
         dup2(pipefd[1], STDOUT_FILENO);
+
         close(pipefd[0]);
 
         execvp(command->command, c_args);
@@ -426,8 +450,9 @@ Command *lastCommand(Command *pCommand) {
 void executeCommand(Command *command) {
     int output;
     char buf;
+    int inputfile;
     if (command->redir_in != nullptr) {
-        int inputfile = open(command->redir_in, O_RDONLY);
+        inputfile = open(command->redir_in, O_RDONLY);
         if (inputfile == -1) {
             perror("open");
             return;
@@ -436,6 +461,7 @@ void executeCommand(Command *command) {
     } else {
         output = executeCommand(command, STDIN_FILENO);
     }
+
     Command *last_command = lastCommand(command);
     pid_t child = fork();
     if (child == 0) {
@@ -456,8 +482,11 @@ void executeCommand(Command *command) {
     }
     if (!command->bg) {
         waitpid(child, NULL, 0);
-    } else {
-        printf("No need to wait");
+        // These file pointers also need to be closed when not waiting for the command to stop, however then we don't
+        // know when the command is stopped and the files can be closed, so this isn't done
+        if (command->redir_in != nullptr)
+            close(inputfile);
+        close(output);
     }
 }
 
@@ -468,7 +497,7 @@ void executeCommand(Command *command) {
  */
 char *getDirName(char *dir) {
     char *home = getenv("HOME");
-    char *found = strstr(dir, home);
+    char *found = strnstr(dir, home, strlen(home));
     if (found == nullptr) {
         return dir;
     }
